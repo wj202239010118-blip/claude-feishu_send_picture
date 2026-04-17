@@ -96,20 +96,31 @@ class PureAISentinel:
     def __init__(self, save_dir, prefix="cap"):
         self.save_dir = save_dir
         self.prefix   = prefix
-        self._busy      = False
-        self._busy_lock = threading.Lock()
+        self._busy         = False
+        self._busy_lock    = threading.Lock()
+        self._cancel_event = threading.Event()
         ensure_dir(save_dir)
 
     # ── 公开接口 ──────────────────────────────────────────────────────────────
 
     def trigger(self):
-        """由热键回调调用；防止并发。"""
+        """由热键回调调用；若已在等待则取消旧操作（不自动重启，让用户再按一次）。"""
         with self._busy_lock:
             if self._busy:
-                print("[跳过] 上一次截图尚未完成，请稍后再试")
+                print("[取消] 检测到重复触发，取消当前等待 — 可再按一次 Ctrl+Shift+X 重新开始")
+                self._cancel_event.set()
                 return
             self._busy = True
+        self._cancel_event.clear()
         threading.Thread(target=self._run, daemon=True).start()
+
+    def cancel(self):
+        """由 Esc 调用，取消正在等待的截图。"""
+        with self._busy_lock:
+            if not self._busy:
+                return
+        self._cancel_event.set()
+        print("[取消] 截图等待已取消（Esc）— 可按 Ctrl+Shift+X 重新开始")
 
     # ── 内部流程 ──────────────────────────────────────────────────────────────
 
@@ -154,10 +165,14 @@ class PureAISentinel:
             self._simulate_feishu()
 
             print(">>> [Step 2] Simulated Ctrl+Shift+A sent to Feishu — draw your region now")
+            print("    按 Esc 或再按 Ctrl+Shift+X 可随时取消等待")
 
-            # 轮询等待剪贴板变化（超时 30 秒）
-            deadline = time.time() + 30.0
+            # 轮询等待剪贴板变化（超时 30 秒，可随时取消）
+            deadline = time.time() + self.TIMEOUT_S
             while time.time() < deadline:
+                if self._cancel_event.is_set():
+                    print(">>> 已取消，退出等待")
+                    return
                 curr_hash = self._get_hash()
                 if curr_hash and curr_hash != old_hash:
                     time.sleep(0.2)   # 给 OS 写稳剪贴板的时间
@@ -168,7 +183,7 @@ class PureAISentinel:
                         return
                 time.sleep(self.POLL_S)
 
-            print(">>> Timeout: no screenshot detected within 30s")
+            print(f">>> Timeout: no screenshot detected within {self.TIMEOUT_S:.0f}s，已自动重置")
 
         except Exception as e:
             print(f">>> 发生异常: {e}")
@@ -259,7 +274,8 @@ def main():
         elif _is_x(key):
             pressed.discard('x')
         elif key == keyboard.Key.esc:
-            pressed.clear()   # Esc clears stuck-key state
+            pressed.clear()        # Esc clears stuck-key state
+            sentinel.cancel()      # Esc also cancels any pending screenshot wait
 
     stop_event = threading.Event()
 
